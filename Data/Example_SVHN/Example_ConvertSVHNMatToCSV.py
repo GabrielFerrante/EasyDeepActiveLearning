@@ -95,7 +95,8 @@ train_df = mat_to_dataset_grouped(diretoriosMat[0], 'F:/SVHN/train/train/')
 test_df = mat_to_dataset_grouped(diretoriosMat[1], 'F:/SVHN/test/test/')
 extra_df = mat_to_dataset_grouped(diretoriosMat[2], 'F:/SVHN/extra/extra/')
 
-output_dir = '.'
+output_dir = 'csv_SVHN'
+os.makedirs(output_dir, exist_ok=True)
 train_df.to_csv(os.path.join(output_dir, 'train.csv'), index=False)
 test_df.to_csv(os.path.join(output_dir, 'test.csv'), index=False)
 extra_df.to_csv(os.path.join(output_dir, 'extra.csv'), index=False)

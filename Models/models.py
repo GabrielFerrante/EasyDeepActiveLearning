@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+#EXAMPLE
 class SVHNCustomCNN(nn.Module):
     def __init__(self, num_positions=5, num_classes=11):
         super(SVHNCustomCNN, self).__init__()
@@ -43,16 +44,19 @@ class SVHNCustomCNN(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2)
         )
 
-    def forward(self, x):
+    def get_embedding(self, x):
+        """Convenção exigida pelas Query_Strategies baseadas em embedding (density/diversity)."""
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
         x = self.layer5(x)
         x = self.layer6(x)
-        
+
         x = self.avgpool(x)
-        features = torch.flatten(x, 1)
-        
+        return torch.flatten(x, 1)
+
+    def forward(self, x):
+        features = self.get_embedding(x)
         logits = [head(features) for head in self.digit_heads]
         return torch.stack(logits, dim=1) # [Batch, 5, 11]
