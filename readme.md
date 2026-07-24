@@ -9,7 +9,7 @@ Biblioteca em Python/PyTorch para Deep Active Learning em visão computacional. 
 - **Estratégia de rotulação (labeling)**: como obter o rótulo de uma amostra não rotulada — oráculo (padrão) ou pseudo-labeling (o próprio modelo se rotula, quando confiante o suficiente).
 - **Estratégia de balanceamento**: como evitar que uma classe domine uma seleção (hoje usada pela pseudo-labeling, mas pensada pra ser reaproveitável).
 
-Um exemplo de ponta a ponta com o dataset SVHN será mantido em um notebook único (ainda a fazer).
+Um exemplo de ponta a ponta com o dataset SVHN está em [`Example_SVHN_ActiveLearning.ipynb`](Example_SVHN_ActiveLearning.ipynb), simulando um cenário sem oráculo real: a query escolhe candidatos incertos e o pseudo-labeling assume o papel de "oráculo" para eles.
 
 ### Estrutura do projeto
 
@@ -26,6 +26,8 @@ MethodsReferences/    artigos de referência (surveys) que embasam os métodos d
 */Example_SVHN/        em cada uma dessas pastas, o que é específico do exemplo com o dataset SVHN
                         fica isolado num subdiretório Example_SVHN/ com prefixo Example_, separado
                         do código genérico da biblioteca
+
+Example_SVHN_ActiveLearning.ipynb   notebook de exemplo, na raiz do projeto
 ```
 
 ### Conceitos centrais
@@ -57,7 +59,23 @@ Cada Task já vem com uma métrica padrão (accuracy, mean IoU, recall@IoU, retr
 
 **Loop de treino** (`Training/train.py`) — `train_model(model, train_loader, test_loader, task, optimizer, device, epochs)`, agnóstico ao tipo de tarefa; quem sabe como calcular loss/métrica é a `task`.
 
-**Ciclo de Active Learning** (`Training/active_learning_cycle.py`) — `run_active_learning_cycle(...)` orquestra N ciclos: (re)treina o modelo do zero a cada ciclo, avalia, roda a `query_strategy` escolhida sobre o pool não rotulado e move as amostras selecionadas para o conjunto rotulado — com checkpoint e log em TensorBoard/CSV a cada ciclo. Opcionalmente, com `pseudo_labeling_fn` + `pseudo_dataset_cls` + `pseudo_balance_fn`, também gera pseudo-rótulos balanceados a cada ciclo para aumentar o treino do ciclo seguinte.
+**Ciclo de Active Learning** — duas variantes, para dois cenários diferentes. Em ambas, cada ciclo (re)treina o modelo do zero, avalia em `test_loader` e salva checkpoint + log em TensorBoard/CSV.
+
+- `run_active_learning_cycle` (`Training/active_learning_cycle.py`) — cenário clássico, com oráculo real: a `query_strategy` roda sobre o pool não rotulado e as amostras escolhidas viram rotuladas com o rótulo verdadeiro do dataset (o oráculo é consultado só para elas). Opcionalmente, com `pseudo_labeling_fn` + `pseudo_dataset_cls` + `pseudo_balance_fn`, também gera pseudo-rótulos sobre o *restante* do pool (o que a query não escolheu) para aumentar o treino do ciclo seguinte.
+- `run_self_labeling_cycle` (`Training/self_labeling_cycle.py`) — cenário sem oráculo real: a `query_strategy` escolhe candidatos e o próprio `pseudo_labeling_fn` atua como "oráculo" só para eles (com um `confidence_threshold` mais permissivo, já que não há outra fonte de rótulo).
+
+#### Diferenças entre `run_active_learning_cycle` e `run_self_labeling_cycle`
+
+| | `run_active_learning_cycle` | `run_self_labeling_cycle` |
+|---|---|---|
+| Cenário | Existe oráculo real (ex.: humano) | Não existe oráculo real disponível |
+| Quem rotula quem a query escolheu | O oráculo — rótulo verdadeiro do dataset | O próprio `pseudo_labeling_fn`, atuando como "oráculo" |
+| Escopo do `pseudo_labeling_fn` | Sobre o *restante* do pool, depois da query já ter retirado sua parte | Só sobre os candidatos que a própria query escolheu |
+| `confidence_threshold` típico | Alto (padrão `0.95`) — é só um complemento opcional | Mais permissivo (ex. `0.5`) — é a única fonte de rótulo disponível pra quem foi selecionado |
+| Persistência do pseudo-rótulo | Transiente: recalculado do zero a cada ciclo, a partir do modelo mais recente | Permanente: gravado uma vez via `on_accepted` (ex.: CSV) e nunca recalculado |
+| Como o "rotulado" entra no treino | `Subset(dataset, labeled_indices)` combinado ao pseudo-rotulado via `ConcatDataset`, em memória | `build_labeled_dataset_fn()` reconstrói o dataset do zero a cada ciclo (ex.: relendo o CSV persistido) |
+| Candidato que não atinge o `confidence_threshold` | N/A — quem a query escolhe sempre vira rotulado (o oráculo não recusa) | Volta pro pool não rotulado; pode ser escolhido de novo em um ciclo futuro |
+| Uso típico | Active Learning clássico, com anotador disponível | Self-training / semi-supervisionado, sem anotador disponível |
 
 ### Métodos de referência (roadmap)
 

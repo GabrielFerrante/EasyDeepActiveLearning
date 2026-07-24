@@ -60,10 +60,13 @@ def pseudo_labeling_strategy(model, device, unlabeled_loader, unlabeled_indices,
 
 class PseudoLabeledDataset(Dataset):
     """
-    Dataset dedicado a amostras nunca rotuladas: para cada índice, lê só a imagem do dataset base
-    (o rótulo real, se existir, nunca é lido/tocado) e devolve o pseudo-rótulo previsto pelo modelo
-    no lugar. Feito para ser combinado com o conjunto rotulado de verdade via ConcatDataset — pseudo-
-    rotulação nunca sobrescreve ou observa o rótulo de uma amostra já rotulada por um oráculo.
+    Dataset dedicado a amostras nunca rotuladas: para cada índice, pega a imagem do dataset base e
+    devolve o pseudo-rótulo previsto pelo modelo no lugar do rótulo — o rótulo real do dataset base
+    é descartado sem nunca ser usado. Mantém os eventuais elementos extras do item original (ex.:
+    o "length" do SVHNCustomDataset) pra ter a mesma aridade do conjunto rotulado de verdade, já que
+    os dois são combinados num único DataLoader via ConcatDataset (misturar tuplas de tamanhos
+    diferentes no mesmo batch quebraria o collate do PyTorch). Pseudo-rotulação nunca sobrescreve ou
+    observa o rótulo de uma amostra já rotulada por um oráculo.
     """
 
     def __init__(self, base_dataset, indices, pseudo_labels):
@@ -75,5 +78,5 @@ class PseudoLabeledDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, i):
-        image = self.base_dataset[self.indices[i]][0]
-        return image, self.pseudo_labels[i]
+        item = self.base_dataset[self.indices[i]]
+        return (item[0], self.pseudo_labels[i]) + tuple(item[2:])
