@@ -44,8 +44,8 @@ class SVHNCustomCNN(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2)
         )
 
+    # YOU MUST BUILD THIS METHOD IN THE YOUR MODEL.
     def get_embedding(self, x):
-        """Convenção exigida pelas Query_Strategies baseadas em embedding (density/diversity)."""
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
@@ -58,5 +58,24 @@ class SVHNCustomCNN(nn.Module):
 
     def forward(self, x):
         features = self.get_embedding(x)
+        return self.classify_from_embedding(features)
+
+    # SÓ PRECISA EXISTIR SE FOR USAR AMOSTRAS SINTÉTICAS (SMOTE/ADASYN, Balance_Strategies).
+    def classify_from_embedding(self, features):
+        """Classifica a partir de um embedding já calculado, pulando o backbone convolucional —
+        convenção exigida pra treinar com amostras sintéticas (sem imagem por trás do embedding)."""
         logits = [head(features) for head in self.digit_heads]
-        return torch.stack(logits, dim=1) # [Batch, 5, 11]
+        return torch.stack(logits, dim=1)  # [Batch, 5, 11]
+
+    # SÓ PRECISA EXISTIR SE FOR USAR A QUERY STRATEGY "LPL" (Query_Strategies/lpl.py).
+    def get_intermediate_features(self, x):
+        """Devolve os mapas de ativação de múltiplos estágios da rede — convenção exigida pelo
+        LossPredictionModule (LPL), que combina features multi-nível pra prever a loss de uma
+        amostra sem conhecer o rótulo dela."""
+        x = self.layer1(x)
+        x = self.layer2(x)
+        f3 = self.layer3(x)
+        f4 = self.layer4(f3)
+        f5 = self.layer5(f4)
+        f6 = self.layer6(f5)
+        return [f3, f4, f5, f6]

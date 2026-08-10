@@ -16,9 +16,9 @@ Um exemplo de ponta a ponta com o dataset SVHN está em [`Example_SVHN_ActiveLea
 ```
 Data/                 dados e scripts de preparação de dados
 Models/                modelos PyTorch (models.py traz um exemplo de CNN pra dígitos do SVHN)
-Query_Strategies/     estratégias de seleção de amostras pro oráculo (Query_Strategies/querys_strategies.py)
-Labeling_Strategies/  estratégias de rotulação, ex. pseudo-labeling (Labeling_Strategies/labeling_strategies.py)
-Balance_Strategies/   estratégias de balanceamento por classe (Balance_Strategies/balance_strategies.py)
+Query_Strategies/     estratégias de seleção pro oráculo (querys_strategies.py + lpl.py/vaal.py/waal.py)
+Labeling_Strategies/  rotulação sem oráculo: labeling_strategies.py + fixmatch/uda/mixmatch/mean_teacher/vat/mpl.py
+Balance_Strategies/   balanceamento por classe (balance_strategies.py: resampling; losses.py: loss functions)
 Training/              loop de treino, ciclo de Active Learning e as Tasks (Training/tasks.py)
 Utils/                 utilitários gerais
 MethodsReferences/    artigos de referência (surveys) que embasam os métodos da lib
@@ -43,19 +43,56 @@ Example_SVHN_ActiveLearning.ipynb   notebook de exemplo, na raiz do projeto
 
 Cada Task já vem com uma métrica padrão (accuracy, mean IoU, recall@IoU, retrieval top-1) mas aceita `criterion`/`metric_fn` customizados.
 
-**Query Strategies** (`Query_Strategies/querys_strategies.py`) — decidem QUAIS amostras do pool não rotulado mandar pro oráculo. Recebem dataloaders (não `dataset` + índices), o que permite plugar qualquer `Dataset`/`transform` próprio:
+**Query Strategies** — decidem QUAIS amostras do pool não rotulado mandar pro oráculo. Recebem dataloaders (não `dataset` + índices), o que permite plugar qualquer `Dataset`/`transform` próprio. A maioria vive em `Query_Strategies/querys_strategies.py` como funções simples; as três que exigem infraestrutura própria de treino (LPL, VAAL, WAAL) ganharam arquivo dedicado:
 
 - `uncertainty_query_strategy` — usa `task.compute_uncertainty` (por isso recebe uma `task`).
+- `margin_query_strategy` — diferença entre as duas classes mais prováveis (menor margem = mais ambíguo).
+- `least_confidence_query_strategy` / `variation_ratio_query_strategy` (mesma função, dois nomes) — `1 - max_y p(y|x)`.
+- `bald_query_strategy` — incerteza epistêmica via MC-Dropout (T passes estocásticos); exige `nn.Dropout` em algum lugar do modelo.
+- `badge_query_strategy` — embeddings de gradiente hipotético (`(p - onehot(ŷ)) ⊗ get_embedding(x)`), batch escolhido via seeding do k-means++ (`sklearn.cluster.kmeans_plusplus`).
+- `ClusterMarginQueryStrategy` (classe, não função) — clustering hierárquico (HAC) rodado uma única vez e cacheado, depois margin + amostragem round-robin entre clusters a cada chamada.
 - `density_query_strategy` / `diversity_query_strategy` — usam embeddings via `model.get_embedding(x)`, funcionam para qualquer Task desde que o modelo implemente esse método.
+- `Query_Strategies/lpl.py` — `LossPredictionModule` + `train_model_with_lpl` (substitui `Training/train.py` nesses ciclos) + `lpl_query_strategy`; exige `model.get_intermediate_features(x)`.
+- `Query_Strategies/vaal.py` — `VAE` + `Discriminator` + `train_vaal` + `vaal_query_strategy`; não usa o modelo alvo, só as imagens.
+- `Query_Strategies/waal.py` — `WassersteinCritic` (sobre `model.get_embedding`) + `train_model_with_waal` (substitui `Training/train.py`) + `waal_query_strategy`; exige uma `task` com `.criterion`.
 
-**Labeling Strategies** (`Labeling_Strategies/labeling_strategies.py`) — decidem COMO obter o rótulo de uma amostra não rotulada, sem envolver oráculo:
+LPL/VAAL/WAAL não encaixam no padrão `query_strategy(model, device, budget, unlabeled_loader, unlabeled_indices, ...)` puro porque dependem de um módulo auxiliar treinado à parte (o módulo de loss, o VAE+discriminador, ou o crítico) — amarre-o antes de passar como `query_strategy`, ex.: `query_strategy = lambda **kw: lpl_query_strategy(loss_prediction_module=trained_module, **kw)`.
 
-- `pseudo_labeling_strategy` — pseudo-labeling clássico (Lee, 2013): aceita como rótulo a predição do modelo pra toda amostra com confiança acima de um threshold, e delega o balanceamento por classe a um `balance_fn`.
+**Labeling Strategies** — decidem COMO obter o rótulo de uma amostra não rotulada, sem envolver oráculo. Como em Query Strategies, as que funcionam como uma função de seleção ficam em `Labeling_Strategies/labeling_strategies.py`; as que precisam de infraestrutura própria de treino (consistency regularization, teacher-student) ganharam arquivo dedicado — todas assumem classificação de rótulo único, exceto `pseudo_labeling_strategy`/`noisy_student_pseudo_label`, que generalizam pra saídas multi-posição como a do exemplo SVHN.
+
+`Labeling_Strategies/labeling_strategies.py`:
+
+- `pseudo_labeling_strategy` — pseudo-labeling clássico (Lee, 2013): aceita como rótulo a predição do modelo pra toda amostra com confiança acima de um threshold fixo, e delega o balanceamento por classe a um `balance_fn`.
+- `flexmatch_strategy` — como acima, mas com um threshold de confiança ADAPTATIVO POR CLASSE (classes que o modelo aprende mais devagar recebem threshold menor).
+- `noisy_student_pseudo_label` — threshold bem mais permissivo (o método confia na regularização por ruído do treino seguinte pra compensar); corta/duplica cada classe pra um `max_per_class` fixo.
+- `co_training_strategy` / `tri_training_strategy` — usam concordância entre 2 ou 3 modelos (em vez de um threshold de confiança) pra decidir o pseudo-rótulo; Tri-Training também estima e aplica o critério de aceitação por taxa de erro do paper original.
 - `PseudoLabeledDataset` — dataset dedicado às amostras pseudo-rotuladas (só lê a imagem do dataset base, nunca o rótulo real); combinado com o conjunto rotulado de verdade via `ConcatDataset` no ciclo, nunca sobrescrevendo um rótulo já existente.
 
-**Balance Strategies** (`Balance_Strategies/balance_strategies.py`) — dado um conjunto de candidatos `(score, index, label)`, decidem como evitar que uma classe domine a seleção:
+`Labeling_Strategies/augmentation.py` — utilitários compartilhados pelos métodos abaixo: `WeakStrongAugmentDataset`/`MultiAugmentDataset` (datasets que devolvem múltiplas augmentations da mesma imagem), `sharpen`/`mixup` (MixMatch), `ema_update`/`clone_model` (Mean Teacher).
+
+- `Labeling_Strategies/fixmatch.py` — `train_model_with_fixmatch`: pseudo-rótulo hard de uma augmentation fraca, cross-entropy contra a predição da augmentation forte, só acima de um threshold de confiança.
+- `Labeling_Strategies/uda.py` — `train_model_with_uda`: como FixMatch, mas com alvo suavizado (sharpening) em vez de hard label, e Training Signal Annealing (TSA) pra não deixar a loss supervisionada convergir rápido demais.
+- `Labeling_Strategies/mixmatch.py` — `train_model_with_mixmatch` / `train_model_with_remixmatch`: guessing de rótulo por média+sharpening sobre K augmentations, MixUp entre rotulado e não rotulado; ReMixMatch acrescenta distribution alignment e augmentation anchoring.
+- `Labeling_Strategies/mean_teacher.py` — `train_model_with_mean_teacher`: um teacher (EMA dos pesos do student) fornece o alvo de uma consistency loss (MSE) pro student.
+- `Labeling_Strategies/vat.py` — `train_model_with_vat`: calcula a perturbação adversarial (via power iteration) que mais muda a predição do modelo, e treina pra ser consistente sob ela — funciona em dados rotulados e não rotulados, sem gerar pseudo-rótulo nenhum.
+- `Labeling_Strategies/mpl.py` — `train_model_with_mpl`: teacher e student treinados juntos; o teacher é atualizado via REINFORCE, usando como recompensa o quanto seus pseudo-rótulos melhoraram o student num batch rotulado.
+
+FixMatch/UDA/MixMatch/ReMixMatch/Mean Teacher/VAT/MPL têm loop de treino próprio (substituem `Training/train.py` para os ciclos que os usam) e exigem `task.criterion` — são técnicas de TREINO, não uma chamada única de seleção como as demais.
+
+**Balance Strategies** — como evitar que uma classe domine uma seleção ou um treino. Duas famílias, dois arquivos:
+
+`Balance_Strategies/balance_strategies.py` — operam sobre uma lista de candidatos `(score, index, label)`:
 
 - `class_balance_strategy` — corta cada classe no tamanho da classe com menos candidatos (ou em `max_per_class`, se informado), mantendo os de maior score primeiro.
+- `random_oversample_strategy` / `random_undersample_strategy` — duplicam/removem candidatos aleatoriamente até igualar as classes; não precisam de `features`.
+- `tomek_links_strategy` / `near_miss_strategy` — undersampling por vizinhança; candidatos precisam vir como 4-tupla `(score, index, label, features)` (ex.: `model.get_embedding(x)`), diferente das duas acima.
+- `smote_oversample` / `adasyn_oversample` — geram amostras SINTÉTICAS por interpolação no espaço de embedding (também precisam de `features`); devolvem `(candidates, synthetic)`, onde `synthetic` são pares `(label, embedding)` sem índice real. Para treinar com elas: `SyntheticEmbeddingDataset` + `EmbeddingClassifierWrapper(model)` (exige `model.classify_from_embedding(features)`, já implementado em `SVHNCustomCNN`).
+
+`Balance_Strategies/losses.py` — não filtram candidatos, mudam a `criterion` de uma `Task`:
+
+- `compute_class_weights` / `class_balanced_weights` — pesos por classe (cost-sensitive / effective number of samples) para `nn.CrossEntropyLoss(weight=...)`.
+- `FocalLoss` — reduz o peso de exemplos já bem classificados, focando o treino nos difíceis.
+- `DynamicCurriculumLoss` — sampling scheduler que decai a distribuição-alvo do batch de desbalanceada pra balanceada ao longo das épocas; exige chamar `.set_epoch(epoch)` a cada época.
 
 **Loop de treino** (`Training/train.py`) — `train_model(model, train_loader, test_loader, task, optimizer, device, epochs)`, agnóstico ao tipo de tarefa; quem sabe como calcular loss/métrica é a `task`.
 
@@ -88,37 +125,46 @@ Os artigos em `MethodsReferences/` são *surveys* que embasam os métodos que a 
 | Entropy / uncertainty softmax | Uncertainty-based | ✅ Implementado (`uncertainty_query_strategy`, via `task.compute_uncertainty`) |
 | KMeans | Representative/Diversity-based | ✅ Implementado (`density_query_strategy`) |
 | CoreSet / K-Center greedy | Representative/Diversity-based | ✅ Implementado (`diversity_query_strategy`) |
-| Margin | Uncertainty-based | ⬜ Planejado |
-| Least Confidence / VarRatio | Uncertainty-based | ⬜ Planejado |
-| BALD (Bayesian AL by Disagreement) | Uncertainty-based | ⬜ Planejado |
-| Loss Prediction Loss (LPL) | Uncertainty-based (model aspect) | ⬜ Planejado |
-| BADGE (gradient embeddings) | Combinada (uncertainty + diversity) | ⬜ Planejado |
-| Cluster-Margin | Representative/Diversity-based | ⬜ Planejado |
-| VAAL / WAAL (adversarial AL) | Representative/Diversity-based | ⬜ Planejado |
+| Margin (Scheffer, Decomain & Wrobel, 2001) | Uncertainty-based | ✅ Implementado (`margin_query_strategy`) |
+| Least Confidence (Lewis & Gale, 1994) / Variation Ratio (Freeman, 1965) | Uncertainty-based | ✅ Implementado (`least_confidence_query_strategy` / `variation_ratio_query_strategy`) |
+| BALD (Houlsby et al., 2011; MC-Dropout via Gal, Islam & Ghahramani, 2017) | Uncertainty-based | ✅ Implementado (`bald_query_strategy`) |
+| BADGE (Ash et al., 2020) | Combinada (uncertainty + diversity) | ✅ Implementado (`badge_query_strategy`) |
+| Cluster-Margin (Citovsky et al., 2021) | Representative/Diversity-based | ✅ Implementado (`ClusterMarginQueryStrategy`) |
+| Loss Prediction Loss / LPL (Yoo & Kweon, 2019) | Uncertainty-based (model aspect) | ✅ Implementado (`Query_Strategies/lpl.py` — módulo auxiliar + treino conjunto) |
+| VAAL (Sinha, Ebrahimi & Darrell, 2019) | Representative/Diversity-based (adversarial) | ✅ Implementado (`Query_Strategies/vaal.py` — VAE + discriminador) |
+| WAAL (Shui, Zhou, Gagné & Wang, 2020) | Combinada (adversarial) | ✅ Implementado (`Query_Strategies/waal.py` — crítico Wasserstein + treino conjunto) |
 
 **Labeling Strategies** — *A Review of Pseudo-Labeling for Computer Vision* (Kage, Rothenberger, Andreadis & Diochnos, 2025)
 
 | Método | Família | Status |
 |---|---|---|
 | Pseudo-Label clássico (Lee, 2013) | Semi-supervisionado, PL original | ✅ Implementado (`pseudo_labeling_strategy`) |
-| FixMatch | Sample scheduling por métrica (threshold + augmentation fraca/forte) | ⬜ Planejado |
-| MixMatch / ReMixMatch | Sample scheduling aleatório + mixing | ⬜ Planejado |
-| Mean Teacher / Noisy Student | Multi-model (teacher-student) | ⬜ Planejado |
-| Co-Training / Tri-Training | Multi-model (múltiplos modelos concordando) | ⬜ Planejado |
-| UDA / VAT | Consistency regularization | ⬜ Planejado |
-| FlexMatch / MPL (Meta Pseudo Labels) | Curriculum/meta-learning | ⬜ Planejado |
+| FlexMatch (Zhang et al., 2021) | Curriculum Pseudo Labeling (threshold adaptativo por classe) | ✅ Implementado (`flexmatch_strategy`) |
+| Noisy Student (Xie et al., 2020) | Self-training com ruído | ✅ Implementado (`noisy_student_pseudo_label`) |
+| Co-Training (Blum & Mitchell, 1998) | Multi-model (duas visões) | ✅ Implementado (`co_training_strategy`) |
+| Tri-Training (Zhou & Li, 2005) | Multi-model (três classificadores) | ✅ Implementado (`tri_training_strategy`) |
+| FixMatch (Sohn et al., 2020) | Sample scheduling por métrica (threshold + augmentation fraca/forte) | ✅ Implementado (`Labeling_Strategies/fixmatch.py`) |
+| UDA (Xie et al., 2019/2020) | Consistency regularization (+ TSA) | ✅ Implementado (`Labeling_Strategies/uda.py`) |
+| MixMatch (Berthelot et al., 2019) | Sample scheduling aleatório + mixing | ✅ Implementado (`Labeling_Strategies/mixmatch.py`) |
+| ReMixMatch (Berthelot et al., 2019b) — núcleo (distribution alignment + augmentation anchoring); a loss auxiliar de rotation prediction do paper ficou fora | Sample scheduling aleatório + mixing | ✅ Implementado (`Labeling_Strategies/mixmatch.py`) |
+| Mean Teacher (Tarvainen & Valpola, 2017) | Multi-model (EMA teacher-student) | ✅ Implementado (`Labeling_Strategies/mean_teacher.py`) |
+| VAT (Miyato et al., 2018) | Consistency regularization (perturbação adversarial) | ✅ Implementado (`Labeling_Strategies/vat.py`) |
+| MPL — Meta Pseudo Labels (Pham et al., 2021) | Curriculum/meta-learning (teacher-student bi-level) | ✅ Implementado (`Labeling_Strategies/mpl.py`) |
 
 **Balance Strategies** — *A Comprehensive Survey on Imbalanced Data Learning* (Gao et al., 2025)
 
 | Método | Família | Status |
 |---|---|---|
 | Balanceamento por classe/quota | Re-labeling (self-training balanceado) | ✅ Implementado (`class_balance_strategy`) |
-| Random over/undersampling | Data re-balancing | ⬜ Planejado |
-| SMOTE / ADASYN | Data re-balancing (geração sintética) | ⬜ Planejado |
-| Tomek Links / NearMiss | Data re-balancing (undersampling por vizinhança) | ⬜ Planejado |
-| Cost-sensitive learning / class weights | Feature representation | ⬜ Planejado |
-| Focal Loss | Feature representation (nível de instância) | ⬜ Planejado |
-| Class-Balanced Loss (effective number of samples) | Feature representation | ⬜ Planejado |
+| Random Oversampling / Undersampling | Data re-balancing | ✅ Implementado (`random_oversample_strategy` / `random_undersample_strategy`) |
+| Tomek Links (Tomek, 1976) | Data re-balancing (undersampling por vizinhança) | ✅ Implementado (`tomek_links_strategy`) |
+| NearMiss (Mani & Zhang, 2003) | Data re-balancing (undersampling por vizinhança) | ✅ Implementado (`near_miss_strategy`, 3 versões) |
+| SMOTE (Chawla et al., 2002) | Data re-balancing (geração sintética) | ✅ Implementado (`smote_oversample`, no espaço de embedding) |
+| ADASYN (He et al., 2008) | Data re-balancing (geração sintética adaptativa) | ✅ Implementado (`adasyn_oversample`, no espaço de embedding) |
+| Cost-sensitive learning / class weights (Ling & Sheng, 2008) | Feature representation | ✅ Implementado (`compute_class_weights`) |
+| Focal Loss (Lin et al., 2017) | Feature representation (nível de instância) | ✅ Implementado (`FocalLoss`) |
+| Class-Balanced Loss (Cui et al., 2019 — effective number of samples) | Feature representation | ✅ Implementado (`class_balanced_weights`) |
+| Dynamic Curriculum Learning (Wang et al., 2019) — só o núcleo (sampling scheduler + DSL loss); a loss auxiliar de metric learning (triplet+easy anchors) do paper ficou fora, por ser uma técnica de representação ortogonal a balanceamento | Feature representation | ✅ Implementado (`DynamicCurriculumLoss`) |
 
 ### Principais tecnologias
 
