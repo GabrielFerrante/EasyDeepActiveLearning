@@ -8,6 +8,8 @@
 
 A forma mais simples de semi-supervisão: usa a própria predição do modelo como rótulo para amostras não rotuladas em que ele já está suficientemente confiante. Não há oráculo, não há segundo modelo, não há augmentation especial — só um threshold de confiança sobre o `argmax` do softmax. É a base histórica sobre a qual quase todas as técnicas mais recentes da biblioteca (FlexMatch, Noisy Student, FixMatch, UDA, MPL...) constroem variações.
 
+**Nota sobre a citação (Lee, 2013)**: o Pseudo-Label original do paper **não** usa um threshold de confiança por amostra. A formulação original é uma única loss `L = L_sup + α(t)·L_unsup` aplicada sobre **todas** as amostras não rotuladas a cada época, com `α(t)` crescendo linearmente por partes ao longo do treino (0 numa fase inicial, depois sobe até um valor final `α_f`) — quanto mais o treino avança, mais peso o sinal não supervisionado ganha. O esquema de "threshold fixo" implementado aqui — e chamado de "pseudo-labeling clássico" pela maior parte da literatura posterior (FixMatch, UDA, FlexMatch todos herdam esse nome) — é essa variante popularizada depois, não uma leitura literal da equação do Lee 2013 original.
+
 ## Algoritmo
 
 1. Roda o modelo (`model.eval()`) sobre todo o `unlabeled_loader`.

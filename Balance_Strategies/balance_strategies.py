@@ -127,9 +127,11 @@ def _split_majority_minority(candidates):
 def tomek_links_strategy(candidates, **kwargs):
     """
     Tomek Links (Tomek, 1976, extensão do Condensed Nearest Neighbor de Hart, 1968): um par (a,b) de
-    classes diferentes forma um Tomek Link se cada um é o vizinho mais próximo do outro. Remove o
-    membro da classe MAJORITÁRIA de cada Tomek Link encontrado — limpa amostras majoritárias que
-    "invadem" a fronteira de decisão da classe minoritária, sem alterar a minoritária.
+    classes diferentes forma um Tomek Link se cada um é o vizinho mais próximo GLOBAL do outro — ou
+    seja, não existe nenhum outro ponto (de qualquer classe) mais perto de a do que b, nem mais perto
+    de b do que a. Remove o membro da classe MAJORITÁRIA de cada Tomek Link encontrado — limpa
+    amostras majoritárias que "invadem" a fronteira de decisão da classe minoritária, sem alterar a
+    minoritária.
 
     candidates: lista de (score, index, label, features) — precisa de features pra calcular
     vizinhança, diferente de class_balance_strategy.
@@ -141,17 +143,20 @@ def tomek_links_strategy(candidates, **kwargs):
     if not majority or not minority:
         return list(candidates)
 
-    majority_features = np.stack([c[3] for c in majority])
-    minority_features = np.stack([c[3] for c in minority])
+    combined = majority + minority
+    features = np.stack([c[3] for c in combined])
+    is_majority = np.array([True] * len(majority) + [False] * len(minority))
 
-    maj_to_min_idx = NearestNeighbors(n_neighbors=1).fit(minority_features).kneighbors(
-        majority_features, return_distance=False)
-    min_to_maj_idx = NearestNeighbors(n_neighbors=1).fit(majority_features).kneighbors(
-        minority_features, return_distance=False)
+    # Vizinho mais próximo GLOBAL de cada ponto (excluindo ele mesmo, por isso n_neighbors=2 e
+    # descarta a coluna 0) — um único fit sobre TODOS os pontos, majoritário+minoritário juntos, é
+    # o que a definição de Tomek Link exige (ver docstring). Ajustar o k-NN separadamente por classe
+    # (majoritária vs. minoritária) over-identifica pares como Tomek Link: um ponto majoritário podia
+    # ter um vizinho majoritário mais próximo ainda, que deveria desqualificar o par.
+    nearest = NearestNeighbors(n_neighbors=2).fit(features).kneighbors(features, return_distance=False)[:, 1]
 
     tomek_positions = {
-        maj_pos for maj_pos, (min_pos,) in enumerate(maj_to_min_idx)
-        if min_to_maj_idx[min_pos, 0] == maj_pos
+        i for i, j in enumerate(nearest)
+        if is_majority[i] and not is_majority[j] and nearest[j] == i
     }
 
     print(f"Tomek Links: removendo {len(tomek_positions)} candidatos majoritarios de {len(majority)}.")
@@ -169,11 +174,15 @@ def near_miss_strategy(candidates, target_count=None, version=1, n_neighbors=3):
       PRÓXIMOS da minoritária (perto da fronteira de decisão).
     - version=2: mantém as majoritárias com MENOR distância média aos n_neighbors vizinhos MAIS
       DISTANTES da minoritária (perto do "centro" da nuvem minoritária; evita outliers da fronteira).
-    - version=3: para cada amostra minoritária, mantém seus n_neighbors vizinhos majoritários mais
-      próximos (garante que toda região minoritária tenha vizinhança majoritária representada).
+    - version=3: algoritmo em duas etapas (Mani & Zhang, 2003). Etapa 1: para cada amostra
+      minoritária, mantém seus n_neighbors vizinhos majoritários mais próximos (garante que toda
+      região minoritária tenha vizinhança majoritária representada) — forma um conjunto candidato,
+      tipicamente maior que target_count. Etapa 2: dentro desse candidato, mantém só os target_count
+      com MAIOR distância média aos seus n_neighbors vizinhos minoritários mais próximos (descarta os
+      mais "ruidosos"/redundantes do candidato).
 
-    candidates: lista de (score, index, label, features). target_count (só usado nas versões 1 e 2):
-    se não informado, iguala a contagem da minoritária.
+    candidates: lista de (score, index, label, features). target_count: se não informado, iguala a
+    contagem da minoritária — usado nas 3 versões (na v3, filtra o conjunto candidato da etapa 1).
     """
     majority, minority = _split_majority_minority(candidates)
     if not majority or not minority:
@@ -187,7 +196,17 @@ def near_miss_strategy(candidates, target_count=None, version=1, n_neighbors=3):
         k = min(n_neighbors, len(majority))
         idx = NearestNeighbors(n_neighbors=k).fit(majority_features).kneighbors(
             minority_features, return_distance=False)
-        kept_positions = sorted(set(idx.flatten().tolist()))
+        candidate_positions = sorted(set(idx.flatten().tolist()))
+
+        # Etapa 2: dentro do candidato da etapa 1, mantém os target_count com MAIOR distância média
+        # aos seus vizinhos minoritários mais próximos.
+        candidate_features = majority_features[candidate_positions]
+        k2 = min(n_neighbors, len(minority))
+        distances, _ = NearestNeighbors(n_neighbors=k2).fit(minority_features).kneighbors(candidate_features)
+        scores = distances.mean(axis=1)
+
+        order = np.argsort(scores)[::-1]  # maior distância média primeiro
+        kept_positions = [candidate_positions[i] for i in order[:target_count]]
         return [majority[i] for i in kept_positions] + minority
 
     if version == 1:

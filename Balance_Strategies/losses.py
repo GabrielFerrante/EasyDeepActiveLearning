@@ -186,7 +186,13 @@ class DynamicCurriculumLoss(nn.Module):
         target_distribution = torch.tensor(self.class_distribution, dtype=torch.float32, device=device) ** g_l
 
         current_counts = torch.bincount(targets_flat, minlength=num_classes).float()
-        current_distribution = current_counts / current_counts.clamp(min=1).min()
+        # min() só entre classes PRESENTES no batch — clamp(min=1) sobre o tensor inteiro antes do
+        # min() faria uma classe ausente do batch (contagem 0 -> vira 1) quase sempre virar o mínimo
+        # artificialmente, colapsando a normalização e distorcendo a razão da Eq. 8 para todas as
+        # classes.
+        present_counts = current_counts[current_counts > 0]
+        min_count = present_counts.min() if present_counts.numel() > 0 else torch.tensor(1.0, device=device)
+        current_distribution = current_counts / min_count.clamp(min=1)
 
         sample_weights = torch.ones_like(targets_flat, dtype=torch.float32)
         for c in range(num_classes):
@@ -207,5 +213,9 @@ class DynamicCurriculumLoss(nn.Module):
         per_sample_loss = self.base_criterion(outputs_flat, targets_flat)  # -log p(y|x), sem peso ainda
         weighted_loss = sample_weights * per_sample_loss
 
-        valid = sample_weights > 0
-        return weighted_loss[valid].mean() if valid.any() else weighted_loss.sum() * 0.0
+        # Eq. 7 do paper: L_DSL = -(1/N) Σ w·log p(...), com N = TAMANHO FIXO DO BATCH — não a
+        # contagem de amostras não-descartadas. Amostras com sample_weights=0 (descartadas na
+        # reamostragem estocástica) já contribuem 0 à soma, então dividir por N direto (em vez de só
+        # pelas "válidas") é a normalização correta; dividir pelas válidas infla a loss quanto mais
+        # amostras forem descartadas no batch, o que não corresponde à fórmula do paper.
+        return weighted_loss.sum() / targets_flat.numel()

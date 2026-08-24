@@ -30,6 +30,17 @@ def train_step_mpl(teacher, student, teacher_optimizer, student_optimizer,
            reward = L_l(θ_S) - L_l(θ'_S)
            teacher_loss = -reward · log T(ŷ_u | x_u; θ_T)                  (política REINFORCE)
 
+    Nota de fidelidade: a derivação exata do Apêndice A do paper (Eq. 12) expressa o gradiente do
+    teacher como um produto interno de dois vetores-gradiente (do student antes/depois do passo),
+    o que exigiria diferenciação de segunda ordem. Esta implementação usa em vez disso uma DIFERENÇA
+    FINITA real — mede a loss do student antes e depois de genuinamente dar o passo de gradiente — que
+    é a aproximação de primeira ordem da mesma quantidade (uma expansão de Taylor da diferença de loss
+    em torno do passo de atualização recupera exatamente a forma do produto interno da Eq. 12), e
+    resulta na mesma forma funcional final `teacher_loss = -reward·log T(...)`. Mais barato
+    computacionalmente (evita diferenciar através do grafo do passo de otimização do student) e
+    matematicamente equivalente a primeira ordem, mas não é uma leitura literal do gradiente analítico
+    do Apêndice A.
+
     Requer task com atributo .criterion. Devolve um dict com as losses do passo (pra logging).
     """
     if not hasattr(task, "criterion"):

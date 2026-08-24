@@ -6,17 +6,18 @@
 
 ## Ideia central
 
-Um **Tomek Link** é um par de amostras `(a, b)` de classes diferentes onde `a` é o vizinho mais próximo de `b` e, ao mesmo tempo, `b` é o vizinho mais próximo de `a` (vizinhança mútua). Esses pares marcam pontos exatamente na fronteira de decisão entre as duas classes — ou ruído (rótulo errado), ou uma região de sobreposição real entre classes.
+Um **Tomek Link** é um par de amostras `(a, b)` de classes diferentes tal que não existe nenhum outro ponto `z` (de qualquer classe) mais perto de `a` do que `b`, nem mais perto de `b` do que `a` — ou seja, `b` é o vizinho mais próximo **global** de `a` (considerando todos os pontos, de qualquer classe) e vice-versa (vizinhança mútua). Esses pares marcam pontos exatamente na fronteira de decisão entre as duas classes — ou ruído (rótulo errado), ou uma região de sobreposição real entre classes.
 
 A estratégia remove o membro **majoritário** de cada Tomek Link encontrado, mantendo o minoritário intacto. O efeito é "limpar" a fronteira: elimina amostras majoritárias que invadem o território da classe minoritária, tornando a fronteira de decisão mais nítida — sem gerar nenhuma amostra nova e sem alterar a classe minoritária.
 
 ## Algoritmo
 
-1. Separa os candidatos em classe **majoritária** (maior contagem) e **minoritária** (todas as demais classes juntas — ver `_split_majority_minority`).
-2. Para cada amostra majoritária, encontra seu vizinho mais próximo (1-NN) dentro da minoritária.
-3. Para cada amostra minoritária, encontra seu vizinho mais próximo (1-NN) dentro da majoritária.
-4. Um par `(maj, min)` é um Tomek Link se o vizinho mais próximo de `maj` é `min` **e** o vizinho mais próximo de `min` é `maj` (mutualidade).
-5. Remove todas as amostras majoritárias que participam de algum Tomek Link; mantém a minoritária inteira.
+1. Separa os candidatos em classe **majoritária** (maior contagem) e **minoritária** (todas as demais classes juntas — ver `_split_majority_minority`), mas junta as features de AMBAS num único conjunto pra busca de vizinhança (ver nota abaixo).
+2. Para cada ponto do conjunto combinado, encontra seu vizinho mais próximo **global** (1-NN sobre todos os pontos, de qualquer classe, excluindo ele mesmo).
+3. Um par `(maj, min)` é um Tomek Link se o vizinho mais próximo global de `maj` é `min` **e** o vizinho mais próximo global de `min` é `maj` (mutualidade) — isso já garante, por construção, que nenhum outro ponto de nenhuma classe está mais perto de nenhum dos dois.
+4. Remove todas as amostras majoritárias que participam de algum Tomek Link; mantém a minoritária inteira.
+
+**Importante — precisa de um único k-NN global, não um k-NN por classe**: ajustar o `NearestNeighbors` separadamente para cada classe (buscar o vizinho mais próximo de cada majoritária *apenas dentre* as minoritárias, e vice-versa) não implementa a definição formal de Tomek Link — pode marcar como Tomek Link um par onde, na verdade, existe um terceiro ponto (da mesma classe que um dos dois) mais próximo, que deveria desqualificar o par. Por exemplo: se uma amostra majoritária `a` tem um vizinho majoritário `c` bem mais próximo que a minoritária `b`, o par `(a,b)` não é um Tomek Link — mas um k-NN ajustado só sobre a minoritária nunca "vê" `c` e aceitaria o par incorretamente. A implementação correta ajusta um único `NearestNeighbors(n_neighbors=2)` sobre o conjunto combinado (majoritária+minoritária), o mesmo padrão usado pela implementação de referência do `imbalanced-learn`.
 
 ## Assinatura
 

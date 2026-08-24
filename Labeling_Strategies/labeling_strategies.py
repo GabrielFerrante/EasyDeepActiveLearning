@@ -11,12 +11,19 @@ from torch.utils.data import Dataset
 def pseudo_labeling_strategy(model, device, unlabeled_loader, unlabeled_indices, balance_fn,
                               confidence_threshold=0.95, max_per_class=None, **kwargs):
     """
-    Pseudo-labeling clássico (Lee, 2013): roda o modelo sobre o pool não rotulado e junta como
+    Pseudo-labeling por threshold de confiança: roda o modelo sobre o pool não rotulado e junta como
     candidato a pseudo-rótulo a predição (argmax do softmax) de toda amostra cuja confiança
     (probabilidade máxima) seja >= confidence_threshold. O balanceamento por classe entre os
     candidatos aprovados é feito por balance_fn (ver Balance_Strategies/balance_strategies.py) — sem
     isso, a classe que o modelo já acerta mais (logo, mais confiante) tende a dominar o conjunto
     pseudo-rotulado e reforçar esse viés a cada ciclo.
+
+    Nota sobre a citação (Lee, 2013): o Pseudo-Label original do paper NÃO usa um threshold de
+    confiança por amostra — usa uma loss única L = L_sup + α(t)·L_unsup sobre TODAS as amostras não
+    rotuladas a cada época, com α(t) crescendo linearmente por partes ao longo do treino (0 até uma
+    fase inicial, depois sobe até α_f). O esquema de "threshold fixo" implementado aqui é a variante
+    popularizada por trabalhos posteriores (FixMatch, UDA, FlexMatch), que a literatura em geral já
+    chama de "pseudo-labeling clássico" — mas não é uma leitura literal da equação do Lee 2013.
 
     balance_fn: callable(candidates, max_per_class) -> candidatos balanceados, onde candidates é uma
     lista de (confidence, dataset_index, pred). Ex.: Balance_Strategies.balance_strategies.class_balance_strategy.
@@ -258,13 +265,18 @@ def tri_training_strategy(models, device, unlabeled_loader, unlabeled_indices,
     SE OS OUTROS DOIS (h_j, h_k) concordam na predição — a concordância de dois classificadores
     independentes serve como "voto de confiança" sem precisar de threshold de probabilidade.
 
-    Segue o critério prático de aceitação do paper original, pra evitar aceitar dados demais quando a
-    taxa de erro estimada do par (h_j,h_k) não compensa: estima e_i, a taxa de erro combinada de
-    (h_j,h_k) sobre labeled_loader (fração das vezes que os dois concordam E erram); só aceita os
-    novos rótulos pra h_i se e_i for menor que o e_i aceito na rodada anterior — e, se o novo conjunto
-    de candidatos for grande demais pro erro estimado, subamostra pra manter
-    e_i·|L_i| < prev_e_i·|prev_L_i| (o "orçamento" esperado de rótulos errados introduzidos não
-    cresce a cada rodada, o que fundamenta teoricamente a convergência do método no paper original).
+    Segue o critério prático de aceitação do paper original (Table I), pra evitar aceitar dados demais
+    quando a taxa de erro estimada do par (h_j,h_k) não compensa: estima e_i, a taxa de erro combinada
+    de (h_j,h_k) sobre labeled_loader (fração das vezes que os dois concordam E erram); só aceita os
+    novos rótulos pra h_i se e_i for menor que o e_i aceito na rodada anterior. Na PRIMEIRA rodada em
+    que h_i seria atualizado (prev_size==0), o paper exige primeiro um piso de tamanho mínimo
+    l_i' = floor(e_i/(prev_e_i - e_i) + 1) — só prossegue se o conjunto de candidatos for maior que
+    esse piso (evita aceitar poucochíssimos rótulos com base numa melhora de erro pequena e ruidosa).
+    Se o conjunto de candidatos for grande demais pro erro estimado, subamostra pra manter
+    e_i·|L_i| < prev_e_i·l_i' (o "orçamento" esperado de rótulos errados introduzidos não cresce a
+    cada rodada, o que fundamenta teoricamente a convergência do método), usando o tamanho de
+    subamostra s = ceil(prev_e_i·l_i'/e_i - 1) (Eq. 10 do paper — arredondamento pra cima, não pra
+    baixo: um floor aqui aceitaria uma amostra a menos do que o orçamento permite).
 
     models: lista de 3 modelos [h1, h2, h3]. prev_errors/prev_sizes: listas de 3 valores — o e_i e
     |L_i| aceitos na rodada ANTERIOR (None na primeira rodada, quando tudo que passar no critério de
@@ -318,10 +330,21 @@ def tri_training_strategy(models, device, unlabeled_loader, unlabeled_indices,
             results.append((np.array([], dtype=int), [], prev_error, prev_size))
             continue
 
+        # Piso de tamanho mínimo l_i' (Table I): na primeira atualização de h_i (prev_size==0), o
+        # paper calcula um piso não-trivial ANTES de aceitar qualquer rótulo; nas rodadas seguintes,
+        # o próprio tamanho aceito na rodada anterior já é o piso.
+        gate_size = int(error_i / (prev_error - error_i) + 1) if prev_size == 0 else prev_size
+
         size_i = len(candidate_positions)
-        if prev_size > 0 and error_i * size_i >= prev_error * prev_size:
+        if gate_size >= size_i:
+            # conjunto de candidatos pequeno demais pro piso de segurança: não atualiza h_i
+            results.append((np.array([], dtype=int), [], prev_error, prev_size))
+            continue
+
+        if error_i * size_i >= prev_error * gate_size:
             # conjunto grande demais pro erro estimado: subamostra pra manter o "orçamento" de ruído
-            max_size = int((prev_error * prev_size) / max(error_i, 1e-8)) - 1
+            # (Eq. 10 do paper: s = ceil(prev_error·gate_size/error_i - 1), arredondado pra cima)
+            max_size = int(np.ceil((prev_error * gate_size) / max(error_i, 1e-8) - 1))
             max_size = max(max_size, 0)
             if max_size < size_i:
                 candidate_positions = rng.choice(candidate_positions, size=max_size, replace=False)

@@ -28,9 +28,16 @@ def _guess_label(model, augmented_batch, temperature):
     return sharpen(q_bar, temperature)
 
 
-def _mixmatch_losses(model, x_hat, p_b, u_augs, q_b, alpha):
-    """Monta X̂/Û (Eqs. 10-13), mistura via MixUp e calcula L_X (CE) e L_U (MSE) — núcleo comum a
-    MixMatch e ReMixMatch (Eqs. 2-5 do MixMatch)."""
+def _mixmatch_losses(model, x_hat, p_b, u_augs, q_b, alpha, unlabeled_loss="mse"):
+    """Monta X̂/Û (Eqs. 10-13), mistura via MixUp e calcula L_X (CE) e L_U — núcleo comum a MixMatch
+    e ReMixMatch (Eqs. 2-5 do MixMatch).
+
+    unlabeled_loss controla a forma de L_U: "mse" (Eq. 4 do MixMatch — usado por
+    train_model_with_mixmatch) ou "ce" (cross-entropy H(q,p_model), usado por
+    train_model_with_remixmatch — o próprio paper do ReMixMatch substitui o MSE do MixMatch por
+    cross-entropy nesse termo, Seção 3.2.1: "enabled us to replace MixMatch's unlabeled-data mean
+    squared error loss with a standard cross-entropy loss"; o ablation do paper mostra que usar MSE
+    aqui piora o erro de 5.94% pra 17.28%)."""
     batch_size = x_hat.size(0)
 
     all_inputs = torch.cat([x_hat] + u_augs, dim=0)
@@ -45,8 +52,12 @@ def _mixmatch_losses(model, x_hat, p_b, u_augs, q_b, alpha):
     log_probs_x = torch.log_softmax(model(mixed_x), dim=-1)
     l_x = -(mixed_p * log_probs_x).sum(dim=-1).mean()  # Eq. 3: H(p, p_model)
 
-    probs_u = torch.softmax(model(mixed_u), dim=-1)
-    l_u = ((mixed_q - probs_u) ** 2).mean()  # Eq. 4: MSE
+    if unlabeled_loss == "ce":
+        log_probs_u = torch.log_softmax(model(mixed_u), dim=-1)
+        l_u = -(mixed_q * log_probs_u).sum(dim=-1).mean()  # ReMixMatch: H(q, p_model)
+    else:
+        probs_u = torch.softmax(model(mixed_u), dim=-1)
+        l_u = ((mixed_q - probs_u) ** 2).mean()  # Eq. 4 do MixMatch: MSE
 
     return l_x, l_u
 
@@ -135,8 +146,8 @@ def train_model_with_mixmatch(
 def train_model_with_remixmatch(
     model, labeled_loader, unlabeled_loader, test_loader, task,
     optimizer, device, epochs, num_classes,
-    sharpening_temperature=0.5, alpha=0.75, lambda_u=1.5, lambda_u_rampup_steps=None,
-    align_momentum=0.999,
+    sharpening_temperature=0.5, alpha=0.75, lambda_u=1.5, lambda_u1=0.5,
+    lambda_u_rampup_steps=None, align_momentum=0.999,
     writer=None, log_prefix="",
 ):
     """
@@ -157,6 +168,18 @@ def train_model_with_remixmatch(
       classes prevista pelo modelo no não rotulado (p̃_model(y), atualizada com EMA de fator
       align_momentum) — corrige o viés do modelo em favor das classes que ele já prevê mais,
       encorajando a distribuição marginal das predições no não rotulado a bater com a do rotulado.
+      Nota: o paper define p̃_model(y) como a média móvel das predições sobre os ÚLTIMOS 128 BATCHES
+      (janela deslizante); aqui é aproximada por uma EMA de decaimento fixo (align_momentum=0.999,
+      janela efetiva ~1000 batches) — mais simples de manter em memória, mas não uma leitura literal
+      do paper.
+
+    Loss total (Eqs. 3-4, "Putting it all together"): L = L_X + λ_u·L_U + λ_u1·L_Û1.
+    - L_X: cross-entropy no lote misto (via MixUp) rotulado.
+    - L_U: cross-entropy H(q_b, p_model) no lote misto (via MixUp) não rotulado — DIFERENTE do
+      MixMatch, que usa MSE aqui; o paper mostra que a Augmentation Anchoring permite (e prefere)
+      cross-entropy nesse termo (ver nota em _mixmatch_losses).
+    - L_Û1: termo "pre-mixup" — cross-entropy do MESMO alvo q_b contra a predição do modelo numa
+      única augmentation FORTE, SEM passar pelo MixUp (λ_u1=0.5 no paper).
 
     Requer uma task de classificação de rótulo único (ex.: ClassificationTask) — ver nota equivalente
     em train_model_with_mixmatch.
@@ -215,17 +238,23 @@ def train_model_with_remixmatch(
             q_b = sharpen(aligned, sharpening_temperature)
 
             optimizer.zero_grad()
-            l_x, l_u = _mixmatch_losses(model, x_hat, p_b, strong_augs, q_b, alpha)
+            l_x, l_u = _mixmatch_losses(model, x_hat, p_b, strong_augs, q_b, alpha, unlabeled_loss="ce")
+
+            # Termo L_Û1 (pre-mixup): cross-entropy do mesmo alvo q_b contra uma augmentation forte
+            # ÚNICA, sem passar pelo MixUp — Eqs. 3-4 do paper.
+            pre_mixup_log_probs = torch.log_softmax(model(strong_augs[0]), dim=-1)
+            l_u1 = -(q_b * pre_mixup_log_probs).sum(dim=-1).mean()
 
             current_lambda_u = _lambda_u_rampup(lambda_u, total_step, lambda_u_rampup_steps)
-            total_loss = l_x + current_lambda_u * l_u
+            total_loss = l_x + current_lambda_u * l_u + lambda_u1 * l_u1
             total_loss.backward()
             optimizer.step()
 
             running_loss += total_loss.item()
             n_steps += 1
             total_step += 1
-            progress_bar.set_postfix(l_x=f"{l_x.item():.3f}", l_u=f"{l_u.item():.3f}", lam=f"{current_lambda_u:.1f}")
+            progress_bar.set_postfix(l_x=f"{l_x.item():.3f}", l_u=f"{l_u.item():.3f}",
+                                      l_u1=f"{l_u1.item():.3f}", lam=f"{current_lambda_u:.1f}")
 
         loss_val = running_loss / n_steps
         test_metric = _evaluate(model, test_loader, task, device, epoch, epochs)

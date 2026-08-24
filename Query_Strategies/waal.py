@@ -83,6 +83,15 @@ def train_model_with_waal(
        embeddings (não os parâmetros do classificador), o gradiente do termo adversarial só afeta o
        extrator de features, exatamente como o Algorithm 1 descreve em separado.
 
+    Nota de fidelidade: o texto principal do Algorithm 1 do paper mostra um único passo de SGD por
+    iteração pros três parâmetros (crítico, extrator, classificador) juntos. `critic_steps=5` treina o
+    crítico por várias iterações antes de cada passo do modelo alvo — é a convenção padrão de treino
+    adversarial estilo WGAN-GP (Gulrajani et al., 2017, já citado pela penalidade de gradiente desta
+    implementação), não uma leitura literal do pseudocódigo de página principal do paper (cujos
+    detalhes de implementação completos estão no material suplementar). Matematicamente, o termo
+    adversarial e a penalidade de gradiente otimizados a cada iteração do crítico são os mesmos das
+    Eqs. do paper — a diferença é só a cadência (múltiplos passos do crítico por passo do modelo).
+
     Requer task com atributo .criterion (ex.: ClassificationTask, SegmentationTask) — WAAL foi
     formulado pro caso de classificação com softmax (as cotas de incerteza da query stage assumem
     isso).

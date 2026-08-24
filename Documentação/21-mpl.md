@@ -24,6 +24,8 @@ Versão prática com rótulos "hard" (Seção 2 do paper, "we sample the hard ps
    teacher_loss = -reward · log T(ŷ_u | x_u; θ_T)          (política REINFORCE)
    ```
 
+**Nota de fidelidade**: a derivação exata do Apêndice A do paper (Eq. 12) expressa o gradiente do teacher como um produto interno entre dois vetores-gradiente do student (antes e depois do passo), o que exigiria diferenciar através do grafo de otimização (segunda ordem). Esta implementação usa em vez disso uma **diferença finita real** — mede a loss do student antes e depois de genuinamente dar o passo de gradiente. Isso é matematicamente a aproximação de primeira ordem da mesma quantidade (uma expansão de Taylor da diferença de loss em torno do passo de atualização recupera a forma do produto interno da Eq. 12), e resulta na mesma forma funcional final `teacher_loss = -reward·log T(...)` — mas não é uma leitura literal do gradiente analítico do Apêndice A. Mais barato computacionalmente (evita diferenciação de segunda ordem), com a mesma forma de resultado.
+
 ## Assinaturas
 
 ```python

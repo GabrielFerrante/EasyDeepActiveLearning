@@ -30,6 +30,14 @@ Comparando `D_target(l)` com a distribuição real do **batch atual** (`D_curren
 - Se `D_target,j(l) / D_current,j >= 1` (classe rara *nesse batch específico*): todas as amostras dessa classe no batch recebem peso igual a essa razão (upweight).
 - Se `< 1` (classe super-representada *nesse batch*): cada amostra da classe é mantida com peso 1 com probabilidade igual a essa razão, e descartada (peso 0) caso contrário — uma reamostragem estocástica por batch.
 
+A loss final (Eq. 7) é normalizada pelo **tamanho fixo do batch `N`** (não pela contagem de amostras que sobraram após a reamostragem estocástica):
+
+```
+L_DSL = -(1/N) Σ_j Σ_i w_j · log p(...)
+```
+
+`D_current` (a distribuição real do batch atual) usa como denominador de normalização a contagem da classe **minoritária presente no batch** — uma classe totalmente ausente do batch não deve entrar nesse mínimo (ela não tem contagem "pequena", ela tem contagem zero, o que é um caso diferente).
+
 ## Assinatura
 
 ```python
@@ -54,3 +62,7 @@ Quando o treino é longo o suficiente (várias dezenas de épocas) para que a tr
 - Só o núcleo de balanceamento foi implementado; a loss auxiliar de metric learning do paper (que ajuda a formar clusters de embedding mais compactos por classe) não está incluída.
 - Exige orquestração externa (`.set_epoch`) — não é plug-and-play como as demais losses da biblioteca, que só precisam ser passadas como `criterion` de uma `Task`.
 - A escolha do `scheduler_fn` é um hiperparâmetro adicional sem uma regra fixa de qual usar — o paper reporta `scheduler_composite` como o exemplo principal, mas não como universalmente melhor.
+
+## Nota de correção
+
+Uma versão anterior desta implementação tinha dois bugs, já corrigidos: (1) a loss era normalizada pela contagem de amostras não-descartadas em vez do tamanho fixo `N` do batch (Eq. 7), o que inflava a escala da loss quanto mais amostras a reamostragem estocástica descartava num batch; (2) o cálculo do mínimo de `D_current` aplicava um `clamp(min=1)` sobre a contagem de TODAS as classes antes de tirar o mínimo — uma classe ausente do batch (contagem 0) virava artificialmente 1 e quase sempre acabava sendo o "mínimo", colapsando a normalização de `D_current` e distorcendo a razão da Eq. 8 para todas as classes presentes. A correção calcula o mínimo só entre as classes efetivamente presentes no batch atual.

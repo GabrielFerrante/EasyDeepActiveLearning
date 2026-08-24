@@ -33,14 +33,24 @@ train_model_with_mixmatch(model, labeled_loader, unlabeled_loader, test_loader, 
 ReMixMatch reaproveita o núcleo do MixMatch (`_mixmatch_losses`) e acrescenta dois componentes:
 
 - **Augmentation Anchoring**: em vez de tirar a média sobre `K` augmentations independentes para o label guessing, usa uma única augmentation **fraca** como "âncora" — mais estável, já que uma augmentation fraca não distorce o suficiente para corromper a predição usada como alvo. `unlabeled_loader` ainda precisa prover `K` versões por amostra; a primeira é tratada como âncora fraca, as demais como augmentations fortes usadas no MixUp.
-- **Distribution Alignment**: a distribuição guessada `q_b` é re-escalada pela razão entre a distribuição de classes do conjunto **rotulado** (fixa, atualizada por EMA simples sobre os batches vistos) e a média móvel da distribuição de classes **prevista pelo modelo** no não rotulado (atualizada com EMA de fator `align_momentum`) — corrige o viés do modelo em favor das classes que ele já prevê mais, encorajando a distribuição marginal das predições no não rotulado a bater com a do rotulado.
+- **Distribution Alignment**: a distribuição guessada `q_b` é re-escalada pela razão entre a distribuição de classes do conjunto **rotulado** (fixa, atualizada por EMA simples sobre os batches vistos) e a média móvel da distribuição de classes **prevista pelo modelo** no não rotulado (atualizada com EMA de fator `align_momentum`) — corrige o viés do modelo em favor das classes que ele já prevê mais, encorajando a distribuição marginal das predições no não rotulado a bater com a do rotulado. O paper define essa média móvel como uma janela deslizante sobre os **últimos 128 batches**; esta implementação usa uma EMA de decaimento fixo (`align_momentum=0.999`, janela efetiva ~1000 batches) como aproximação mais simples de manter em memória — não é uma leitura literal do paper.
+
+A loss final (Eqs. 3-4, "Putting it all together") tem **três** termos, não dois:
+
+```
+L = L_X + λ_u·L_U + λ_u1·L_Û1
+```
+
+- `L_X`: cross-entropy no lote misto (via MixUp) rotulado — igual ao MixMatch.
+- `L_U`: cross-entropy `H(q_b, p_model)` no lote misto (via MixUp) não rotulado — **diferente do MixMatch**, que usa MSE aqui. O paper mostra que a Augmentation Anchoring torna a predição usada como alvo estável o bastante para trocar o MSE do MixMatch por cross-entropy nesse termo (Seção 3.2.1); o próprio ablation do paper (Table 3) mostra que usar MSE em vez de CE nesse termo faz o erro saltar de 5.94% para 17.28%.
+- `L_Û1`: termo **pre-mixup** — cross-entropy do mesmo alvo `q_b` contra a predição do modelo numa única augmentation forte, **sem** passar pelo MixUp (`λ_u1=0.5` no paper).
 
 ### Assinatura
 
 ```python
 train_model_with_remixmatch(model, labeled_loader, unlabeled_loader, test_loader, task,
                              optimizer, device, epochs, num_classes,
-                             sharpening_temperature=0.5, alpha=0.75, lambda_u=1.5,
+                             sharpening_temperature=0.5, alpha=0.75, lambda_u=1.5, lambda_u1=0.5,
                              lambda_u_rampup_steps=None, align_momentum=0.999,
                              writer=None, log_prefix="") -> (loss, test_metric)
 ```
@@ -59,4 +69,9 @@ Quando há orçamento para K augmentations por amostra não rotulada (mais caro 
 
 - `λ_u` do MixMatch (até 75) é sensível à escala relativa de `L_X`/`L_U` — vale a pena monitorar as duas separadamente (o loop já reporta ambas via `progress_bar.set_postfix`).
 - ReMixMatch sem a loss de rotation prediction não é 100% fiel ao paper original — só o núcleo de balanceamento/consistência foi implementado.
+- A Distribution Alignment usa EMA em vez da janela deslizante de 128 batches do paper (ver nota acima) — aproximação razoável, mas não idêntica.
 - Ambas assumem rótulo único, com `num_classes` fixo conhecido de antemão (usado para o one-hot dos rótulos reais).
+
+## Nota de correção
+
+Uma versão anterior de `train_model_with_remixmatch` reaproveitava a loss `L_U` do MixMatch (MSE) sem trocá-la por cross-entropy, e não tinha o termo `L_Û1` (pre-mixup) — na prática rodava MixMatch+Distribution Alignment+Augmentation Anchoring, mas não a loss real do ReMixMatch. Ambos os pontos foram corrigidos: `_mixmatch_losses` agora aceita `unlabeled_loss="ce"` (usado só pelo ReMixMatch) e o loop de `train_model_with_remixmatch` calcula `L_Û1` explicitamente.
