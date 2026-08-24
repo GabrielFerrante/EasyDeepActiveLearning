@@ -22,6 +22,8 @@ Balance_Strategies/   balanceamento por classe (balance_strategies.py: resamplin
 Training/              loop de treino, ciclo de Active Learning e as Tasks (Training/tasks.py)
 Utils/                 utilitários gerais
 MethodsReferences/    artigos de referência (surveys) que embasam os métodos da lib
+Documentação/          um .md por técnica de Balance/Labeling Strategies (ideia central, algoritmo,
+                        assinatura, quando usar, limitações) — ver Documentação/README.md
 
 */Example_SVHN/        em cada uma dessas pastas, o que é específico do exemplo com o dataset SVHN
                         fica isolado num subdiretório Example_SVHN/ com prefixo Example_, separado
@@ -116,7 +118,7 @@ FixMatch/UDA/MixMatch/ReMixMatch/Mean Teacher/VAT/MPL têm loop de treino própr
 
 ### Métodos de referência (roadmap)
 
-Os artigos em `MethodsReferences/` são *surveys* que embasam os métodos que a lib pretende oferecer, um por categoria de estratégia. Cada tabela lista os métodos mais relevantes de cada survey — o que já está implementado e o que é candidato a próxima implementação.
+Os artigos em `MethodsReferences/` são *surveys* que embasam os métodos que a lib pretende oferecer, um por categoria de estratégia. Cada tabela lista os métodos mais relevantes de cada survey — o que já está implementado e o que é candidato a próxima implementação. Para uma explicação aprofundada de cada método já implementado (ideia central, algoritmo/fórmulas, assinatura, quando usar, limitações), ver os arquivos em [`Documentação/`](Documentação/README.md).
 
 **Query Strategies** — *A Comparative Survey of Deep Active Learning* (Zhan et al., 2022)
 

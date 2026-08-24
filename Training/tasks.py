@@ -90,7 +90,13 @@ class ClassificationTask(Task):
 
     def compute_loss(self, model, batch, device):
         inputs, targets = batch[0].to(device), batch[1].to(device)
-        outputs = model(inputs)
+        outputs = model(inputs)  # [Batch, ..., num_classes]
+        # achata dimensões extras (ex.: [Batch, N_posições, C]) antes do criterion, já que a
+        # convenção da lib trata a classe como a última dimensão — nn.CrossEntropyLoss padrão
+        # espera a classe no índice 1, então sem isso quebra pra saídas multi-posição (ex. SVHN).
+        if outputs.dim() > 2:
+            outputs = outputs.reshape(-1, outputs.size(-1))
+            targets = targets.reshape(-1)
         return self.criterion(outputs, targets)
 
     def compute_metric(self, model, batch, device):

@@ -74,7 +74,15 @@ def train_model_with_mixmatch(
 
     labeled_loader: rótulos como índice de classe (convertidos pra one-hot internamente).
     lambda_u_rampup_steps: se informado, λ_u sobe linearmente de 0 até lambda_u ao longo desses passos.
+
+    Requer uma task de classificação de rótulo único (ex.: ClassificationTask) — usada aqui só pra
+    avaliação (task.compute_metric), já que L_X/L_U são calculadas internamente (CE + MSE, Eqs. 3-4),
+    mas uma task sem atributo .criterion (ex.: DetectionTask, VLMContrastiveTask) indica um formato de
+    batch/saída incompatível com a suposição de rótulo único one-hot deste método.
     """
+    if not hasattr(task, "criterion"):
+        raise AttributeError("MixMatch exige uma task de classificação (ex.: ClassificationTask).")
+
     total_step = 0
     loss_val = 0.0
     test_metric = 0.0
@@ -149,7 +157,13 @@ def train_model_with_remixmatch(
       classes prevista pelo modelo no não rotulado (p̃_model(y), atualizada com EMA de fator
       align_momentum) — corrige o viés do modelo em favor das classes que ele já prevê mais,
       encorajando a distribuição marginal das predições no não rotulado a bater com a do rotulado.
+
+    Requer uma task de classificação de rótulo único (ex.: ClassificationTask) — ver nota equivalente
+    em train_model_with_mixmatch.
     """
+    if not hasattr(task, "criterion"):
+        raise AttributeError("ReMixMatch exige uma task de classificação (ex.: ClassificationTask).")
+
     labeled_class_distribution = torch.ones(num_classes, device=device) / num_classes
     model_prediction_ema = torch.ones(num_classes, device=device) / num_classes
     distribution_initialized = False
