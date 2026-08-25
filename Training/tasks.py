@@ -59,6 +59,27 @@ def retrieval_top1_accuracy(image_embeds, text_embeds):
     return (preds == targets).float().cpu().tolist()
 
 
+def regression_mae(outputs, targets):
+    """Erro absoluto médio por amostra — devolve uma lista, um valor por amostra (média sobre
+    dimensões extras se a saída for multi-alvo, ex.: vários valores contínuos por amostra)."""
+    error = (outputs - targets).abs()
+    while error.dim() > 1:
+        error = torch.mean(error, dim=-1)
+    return error.cpu().tolist()
+
+
+def _enable_dropout_only(model):
+    """model.eval() geral, mas reativa só as camadas nn.Dropout — deixa BatchNorm em eval (não
+    reestima estatísticas com passadas estocásticas), enquanto Dropout injeta a variação estocástica
+    que a incerteza via MC-Dropout precisa. Mesmo princípio de Query_Strategies/querys_strategies.py:
+    _enable_dropout, duplicado aqui pra Training/tasks.py não depender de Query_Strategies (a
+    dependência é sempre estratégia -> task, nunca o contrário)."""
+    model.eval()
+    for module in model.modules():
+        if isinstance(module, nn.Dropout) or isinstance(module, nn.Dropout2d):
+            module.train()
+
+
 # --- TASKS ---
 
 class Task:
@@ -118,6 +139,18 @@ class ClassificationTask(Task):
 
         return entropy.cpu().numpy()
 
+    def collect_predictions(self, model, batch, device):
+        """Usado por Metrics/task_metrics.py::evaluate_task pra relatórios agregados (precision/
+        recall/F1/matriz de confusão) — devolve (outputs, targets) já achatados e em CPU, prontos pra
+        acumular por vários batches."""
+        inputs, targets = batch[0].to(device), batch[1].to(device)
+        with torch.no_grad():
+            outputs = model(inputs)  # [Batch, ..., C]
+        if outputs.dim() > 2:
+            outputs = outputs.reshape(-1, outputs.size(-1))
+            targets = targets.reshape(-1)
+        return outputs.cpu(), targets.cpu()
+
 
 class SegmentationTask(Task):
     """Supervisionada, pixel a pixel: batch = (images, masks); modelo devolve [Batch, C, H, W]."""
@@ -148,6 +181,12 @@ class SegmentationTask(Task):
         entropy = torch.mean(entropy_map, dim=(1, 2))  # incerteza média por pixel, por amostra
 
         return entropy.cpu().numpy()
+
+    def collect_predictions(self, model, batch, device):
+        inputs, targets = batch[0].to(device), batch[1].to(device)
+        with torch.no_grad():
+            outputs = model(inputs)  # [Batch, C, H, W]
+        return outputs.cpu(), targets.cpu()
 
 
 def _move_images(images, device):
@@ -198,6 +237,15 @@ class DetectionTask(Task):
             uncertainties.append(1.0 if scores.numel() == 0 else 1.0 - scores.mean().item())
 
         return uncertainties
+
+    def collect_predictions(self, model, batch, device):
+        images = _move_images(batch[0], device)
+        targets = _move_targets(batch[1], device)
+        with torch.no_grad():
+            predictions = model(images)  # model.training deve estar False
+        predictions = [{k: (v.cpu() if torch.is_tensor(v) else v) for k, v in p.items()} for p in predictions]
+        targets = [{k: (v.cpu() if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
+        return predictions, targets
 
 
 class VLMContrastiveTask(Task):
@@ -251,3 +299,71 @@ class VLMContrastiveTask(Task):
         margin = top_k[:, 0] - top_k[:, 1] if k > 1 else top_k[:, 0]
 
         return (-margin).cpu().numpy()  # margem pequena => mais incerto
+
+    def collect_predictions(self, model, batch, device):
+        with torch.no_grad():
+            image_embeds, text_embeds = self._embed(model, batch, device)
+        return image_embeds.cpu(), text_embeds.cpu()
+
+
+class RegressionTask(Task):
+    """
+    Supervisionada, saída contínua: batch = (inputs, targets, ...). Cobre regressão escalar
+    ([Batch]) e multi-alvo ([Batch, D]) — targets deve ter a mesma forma da saída do modelo (ou ser
+    broadcastável para ela).
+    """
+
+    def __init__(self, criterion=None, metric_fn=None, mc_dropout_samples=0):
+        self.criterion = criterion or nn.MSELoss()
+        self.metric_fn = metric_fn or regression_mae
+        # >0 ativa compute_uncertainty via MC-Dropout (ver docstring do método) — não há uma
+        # noção de "entropia" principiada pra saída contínua, então é opt-in.
+        self.mc_dropout_samples = mc_dropout_samples
+
+    def compute_loss(self, model, batch, device):
+        inputs, targets = batch[0].to(device), batch[1].to(device).float()
+        outputs = model(inputs).reshape(targets.shape)
+        return self.criterion(outputs, targets)
+
+    def compute_metric(self, model, batch, device):
+        inputs, targets = batch[0].to(device), batch[1].to(device).float()
+        with torch.no_grad():
+            outputs = model(inputs).reshape(targets.shape)
+        return self.metric_fn(outputs, targets)
+
+    def compute_uncertainty(self, model, batch, device):
+        """
+        Não existe uma noção de "entropia" pra saída contínua. Usa a variância preditiva entre
+        mc_dropout_samples passadas estocásticas (MC-Dropout — mesmo princípio do BALD em
+        Query_Strategies/querys_strategies.py::bald_query_strategy; exige nn.Dropout em algum lugar
+        do modelo) como proxy de incerteza epistêmica: maior variância entre as passadas = modelo
+        menos confiante na predição daquele ponto.
+        """
+        if self.mc_dropout_samples <= 0:
+            raise NotImplementedError(
+                "RegressionTask.compute_uncertainty exige mc_dropout_samples > 0 (MC-Dropout) — "
+                "instancie RegressionTask(mc_dropout_samples=T) pra usar com estratégias de query "
+                "baseadas em incerteza (ex. uncertainty_query_strategy). Sem MC-Dropout não há uma "
+                "noção principiada de incerteza pra saída contínua."
+            )
+        inputs = batch[0].to(device)
+        training_mode = model.training
+        _enable_dropout_only(model)
+        try:
+            predictions = []
+            with torch.no_grad():
+                for _ in range(self.mc_dropout_samples):
+                    predictions.append(model(inputs))
+            stacked = torch.stack(predictions, dim=0)  # [T, Batch, ...]
+            variance = stacked.var(dim=0)
+            while variance.dim() > 1:
+                variance = torch.mean(variance, dim=-1)
+            return variance.cpu().numpy()
+        finally:
+            model.train(training_mode)
+
+    def collect_predictions(self, model, batch, device):
+        inputs, targets = batch[0].to(device), batch[1].to(device).float()
+        with torch.no_grad():
+            outputs = model(inputs).reshape(targets.shape)
+        return outputs.cpu(), targets.cpu()

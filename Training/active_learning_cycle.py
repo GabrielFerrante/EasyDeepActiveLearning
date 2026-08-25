@@ -5,7 +5,10 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
-from train import train_model
+from train import train_model, evaluate
+from tasks import ClassificationTask
+# Metrics/ precisa estar no sys.path do chamador, igual às demais pastas da lib (ex.: Training/).
+from al_metrics import ALMetricsTracker, selected_sample_metric, update_known_classes
 
 
 def save_al_checkpoint(model, optimizer, cycle, labeled_indices, metric, path="checkpoints"):
@@ -54,12 +57,25 @@ def run_active_learning_cycle(
     pseudo_balance_fn=None,
     pseudo_label_confidence=0.95,
     pseudo_label_max_per_class=None,
+    metrics_tracker=None,
+    al_metrics_csv=None,
 ):
     """
     Orquestra N ciclos de active learning: a cada ciclo (re)treina o modelo do zero (via model_fn) só
     com o conjunto rotulado (+ pseudo-rotulado, se pseudo_labeling_fn for informado), avalia em
     test_loader, roda a query_strategy escolhida sobre o pool não rotulado e move as amostras
     selecionadas de unlabeled_indices para labeled_indices.
+
+    metrics_tracker: instância opcional de Metrics.al_metrics.ALMetricsTracker — se não informada,
+    uma é criada internamente (sempre instrumentado; passe a sua se quiser inspecionar/plotar os
+    dados depois, já que o retorno da função não muda). Cada ciclo registra: tempo de treino/seleção/
+    classificação (training_time_s/selection_time_s/classification_time_s), quantas classes distintas
+    já são conhecidas no conjunto rotulado (known_classes — só pra ClassificationTask, já que "classe"
+    não tem uma leitura direta pras demais tasks), e o desempenho do modelo ATUAL (antes de re-
+    treinar) sobre as amostras que ele mesmo acabou de selecionar nesse ciclo, uma vez que o rótulo
+    real delas é conhecido (selected_sample_metric — ver Metrics.al_metrics.selected_sample_metric).
+    al_metrics_csv: caminho opcional pra persistir o tracker inteiro em CSV a cada ciclo (sobrescreve,
+    seguro de chamar repetidamente).
 
     model_fn: callable sem argumentos que devolve um modelo novo (já inicializado) a cada ciclo.
     task: instância de uma classe de Training/tasks.py (Classification/Segmentation/Detection/
@@ -89,6 +105,17 @@ def run_active_learning_cycle(
     unlabeled_indices = np.array(unlabeled_indices)
     pseudo_indices, pseudo_labels = np.array([], dtype=int), []
 
+    if metrics_tracker is None:
+        metrics_tracker = ALMetricsTracker()
+
+    is_classification = isinstance(task, ClassificationTask)
+    known_classes = set()
+    if is_classification and len(labeled_indices) > 0:
+        seed_loader = DataLoader(Subset(dataset, labeled_indices), batch_size=batch_size,
+                                  shuffle=False, num_workers=num_workers)
+        for batch in seed_loader:
+            update_known_classes(known_classes, batch[1])
+
     for cycle in range(num_cycles):
         print(f"\n--- Iniciando Ciclo de AL {cycle} | Labeled Size: {len(labeled_indices)} "
               f"| Pseudo-Labeled Size: {len(pseudo_indices)} ---")
@@ -109,10 +136,14 @@ def run_active_learning_cycle(
         )
 
         writer = SummaryWriter(log_dir=os.path.join(log_dir, f"AL_Cycle_{cycle}"))
-        loss, test_metric = train_model(
-            model, train_loader, test_loader, task, optimizer, device, epochs, writer=writer,
-        )
-        writer.close()
+        with metrics_tracker.timed(cycle, "training_time_s"):
+            loss, test_metric = train_model(
+                model, train_loader, test_loader, task, optimizer, device, epochs, writer=writer,
+            )
+        # passada de inferência dedicada sobre test_loader, só pra medir "tempo de classificação"
+        # isoladamente do treino (train_model já avalia a cada época, mas misturado ao treino).
+        with metrics_tracker.timed(cycle, "classification_time_s"):
+            evaluate(model, test_loader, task, device, desc=f"Classify [{cycle}]")
 
         save_al_checkpoint(model, optimizer, cycle, labeled_indices, test_metric, path=checkpoint_dir)
         if history_csv:
@@ -129,16 +160,44 @@ def run_active_learning_cycle(
             shuffle=False, num_workers=num_workers,
         )
 
-        new_indices = query_strategy(
-            model=model,
-            device=device,
-            budget=cycle_budget,
-            unlabeled_loader=unlabeled_loader,
-            unlabeled_indices=unlabeled_indices,
-            labeled_loader=labeled_loader,
-            labeled_indices=labeled_indices,
-            task=task,
+        with metrics_tracker.timed(cycle, "selection_time_s"):
+            new_indices = query_strategy(
+                model=model,
+                device=device,
+                budget=cycle_budget,
+                unlabeled_loader=unlabeled_loader,
+                unlabeled_indices=unlabeled_indices,
+                labeled_loader=labeled_loader,
+                labeled_indices=labeled_indices,
+                task=task,
+            )
+
+        # Desempenho do modelo ATUAL (recém-treinado, ainda não viu estas amostras) sobre o que a
+        # query acabou de escolher, agora que o rótulo real é conhecido — quantifica quão
+        # "informativa" a seleção foi (ver Metrics.al_metrics.selected_sample_metric).
+        new_selected_loader = DataLoader(
+            Subset(dataset, new_indices), batch_size=batch_size,
+            shuffle=False, num_workers=num_workers,
         )
+        cycle_selected_metric = selected_sample_metric(model, device, task, new_selected_loader)
+
+        if is_classification:
+            for batch in new_selected_loader:
+                update_known_classes(known_classes, batch[1])
+
+        metrics_tracker.record(
+            cycle,
+            num_labeled=len(labeled_indices),
+            num_selected=len(new_indices),
+            known_classes=(len(known_classes) if is_classification else None),
+            selected_sample_metric=cycle_selected_metric,
+            train_loss=loss,
+            test_metric=test_metric,
+        )
+        metrics_tracker.log_to_tensorboard(writer, cycle)
+        writer.close()
+        if al_metrics_csv:
+            metrics_tracker.to_csv(al_metrics_csv)
 
         new_indices_set = set(new_indices)
         unlabeled_indices = np.array([i for i in unlabeled_indices if i not in new_indices_set])

@@ -20,6 +20,7 @@ Query_Strategies/     estratégias de seleção pro oráculo (querys_strategies.
 Labeling_Strategies/  rotulação sem oráculo: labeling_strategies.py + fixmatch/uda/mixmatch/mean_teacher/vat/mpl.py
 Balance_Strategies/   balanceamento por classe (balance_strategies.py: resampling; losses.py: loss functions)
 Training/              loop de treino, ciclo de Active Learning e as Tasks (Training/tasks.py)
+Metrics/                métricas de avaliação por tarefa (task_metrics.py) e do processo de AL (al_metrics.py)
 Utils/                 utilitários gerais
 MethodsReferences/    artigos de referência (surveys) que embasam os métodos da lib
 Documentação/          um .md por técnica de Balance/Labeling Strategies (ideia central, algoritmo,
@@ -42,8 +43,9 @@ Example_SVHN_ActiveLearning.ipynb   notebook de exemplo, na raiz do projeto
 | `SegmentationTask` | `(images, masks)` | `criterion(outputs, masks)` | entropia softmax média por pixel |
 | `DetectionTask` | `(images, targets)` — convenção torchvision | `model(images, targets)` devolve o dict de losses | `1 - confiança média` das detecções |
 | `VLMContrastiveTask` | `(images, texts)` — pares alinhados | InfoNCE simétrica (estilo CLIP) | margem de similaridade dentro do batch |
+| `RegressionTask` | `(inputs, targets)` — alvo contínuo, escalar ou multi-alvo | `criterion(outputs, targets)` (padrão `nn.MSELoss`) | variância entre passadas MC-Dropout (opt-in via `mc_dropout_samples`; sem isso, levanta `NotImplementedError`) |
 
-Cada Task já vem com uma métrica padrão (accuracy, mean IoU, recall@IoU, retrieval top-1) mas aceita `criterion`/`metric_fn` customizados.
+Cada Task já vem com uma métrica padrão (accuracy, mean IoU, recall@IoU, retrieval top-1, MAE) mas aceita `criterion`/`metric_fn` customizados. Toda Task também implementa `collect_predictions(model, batch, device)` — devolve `(predictions, targets)` já em CPU, usado por `Metrics/task_metrics.py::evaluate_task` para montar relatórios agregados sobre um loader inteiro (ver seção **Metrics** abaixo).
 
 **Query Strategies** — decidem QUAIS amostras do pool não rotulado mandar pro oráculo. Recebem dataloaders (não `dataset` + índices), o que permite plugar qualquer `Dataset`/`transform` próprio. A maioria vive em `Query_Strategies/querys_strategies.py` como funções simples; as três que exigem infraestrutura própria de treino (LPL, VAAL, WAAL) ganharam arquivo dedicado:
 
@@ -98,10 +100,27 @@ FixMatch/UDA/MixMatch/ReMixMatch/Mean Teacher/VAT/MPL têm loop de treino própr
 
 **Loop de treino** (`Training/train.py`) — `train_model(model, train_loader, test_loader, task, optimizer, device, epochs)`, agnóstico ao tipo de tarefa; quem sabe como calcular loss/métrica é a `task`.
 
-**Ciclo de Active Learning** — duas variantes, para dois cenários diferentes. Em ambas, cada ciclo (re)treina o modelo do zero, avalia em `test_loader` e salva checkpoint + log em TensorBoard/CSV.
+**Metrics** — duas famílias, dois arquivos, papéis bem diferentes:
+
+`Metrics/task_metrics.py` — avalia a TAREFA em si (não o processo de AL). Diferente de `task.compute_metric` (um valor por amostra de UM batch, leve, usado dentro do loop de treino), aqui as métricas são calculadas sobre a coleção INTEIRA de predições de um loader — necessário pra tudo que não é uma simples média por amostra (precision/recall/F1, matriz de confusão, mAP, R², recall@k...).
+
+- `evaluate_task(model, loader, task, device)` — ponto de entrada único: roda o modelo sobre todo o `loader` (via `task.collect_predictions`) e devolve o relatório certo pro tipo de `task`.
+- `classification_report` — accuracy, precision/recall/F1 (macro e weighted, por classe), matriz de confusão. `top_k_accuracy` à parte.
+- `regression_report` — MAE, MSE, RMSE, R², MAPE.
+- `segmentation_report` — pixel accuracy, mean IoU (global e por classe), mean Dice.
+- `detection_report` — precision/recall/F1 por threshold de IoU (correspondência gulosa por score, não a mAP oficial do COCO) + uma aproximação simples de mAP.
+- `retrieval_report` — recall@k e MRR (mean reciprocal rank), nas duas direções (imagem→texto e texto→imagem).
+
+`Metrics/al_metrics.py` — avalia o PROCESSO de Active Learning (a query strategy, o custo de cada ciclo), não a tarefa. Já vem plugado em `run_active_learning_cycle`/`run_self_labeling_cycle` (ver abaixo); use direto só se estiver orquestrando um ciclo próprio.
+
+- `ALMetricsTracker` — acumula por ciclo: tempos (`training_time_s`/`selection_time_s`/`classification_time_s`, +`pseudo_labeling_time_s` no self-labeling), `known_classes`, `selected_sample_metric`/`acceptance_rate`, `test_metric`. `.to_csv(path)` grava tudo (sobrescreve, seguro chamar a cada ciclo); `.log_to_tensorboard(writer, cycle)` escreve os campos numéricos como `ALMetrics/<campo>`.
+- `selected_sample_metric(model, device, task, loader)` — desempenho do modelo ATUAL (antes de re-treinar) sobre as amostras que a query acabou de escolher, uma vez que o rótulo é conhecido — quantifica quão "informativa" a seleção foi (se o modelo já acertava, a seleção não trouxe muita informação nova).
+- `count_known_classes` / `update_known_classes` — quantas classes distintas já apareceram no conjunto rotulado (achatando rótulos multi-posição); a segunda atualiza incrementalmente um `set()`, mais barato que recontar tudo a cada ciclo.
+
+**Ciclo de Active Learning** — duas variantes, para dois cenários diferentes. Em ambas, cada ciclo (re)treina o modelo do zero, avalia em `test_loader`, salva checkpoint + log em TensorBoard/CSV, e registra as métricas de processo acima num `ALMetricsTracker` (parâmetros opcionais `metrics_tracker`/`al_metrics_csv` — se `metrics_tracker` não for informado, um é criado internamente; passe o seu pra inspecionar/plotar os dados depois).
 
 - `run_active_learning_cycle` (`Training/active_learning_cycle.py`) — cenário clássico, com oráculo real: a `query_strategy` roda sobre o pool não rotulado e as amostras escolhidas viram rotuladas com o rótulo verdadeiro do dataset (o oráculo é consultado só para elas). Opcionalmente, com `pseudo_labeling_fn` + `pseudo_dataset_cls` + `pseudo_balance_fn`, também gera pseudo-rótulos sobre o *restante* do pool (o que a query não escolheu) para aumentar o treino do ciclo seguinte.
-- `run_self_labeling_cycle` (`Training/self_labeling_cycle.py`) — cenário sem oráculo real: a `query_strategy` escolhe candidatos e o próprio `pseudo_labeling_fn` atua como "oráculo" só para eles (com um `confidence_threshold` mais permissivo, já que não há outra fonte de rótulo).
+- `run_self_labeling_cycle` (`Training/self_labeling_cycle.py`) — cenário sem oráculo real: a `query_strategy` escolhe candidatos e o próprio `pseudo_labeling_fn` atua como "oráculo" só para eles (com um `confidence_threshold` mais permissivo, já que não há outra fonte de rótulo). Como não existe rótulo real pras amostras escolhidas, a métrica de processo análoga a `selected_sample_metric` aqui é `acceptance_rate` — fração dos candidatos que o próprio pseudo-labeling aceitou.
 
 #### Diferenças entre `run_active_learning_cycle` e `run_self_labeling_cycle`
 
